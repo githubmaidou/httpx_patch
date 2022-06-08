@@ -1,0 +1,426 @@
+diff -uNr -x .idea httpx-1.2.1/common/fingerprint/data/all.json httpx-1.2.1-m/common/fingerprint/data/all.json
+--- httpx-1.2.1/common/fingerprint/data/all.json	1970-01-01 08:00:00.000000000 +0800
++++ httpx-1.2.1-m/common/fingerprint/data/all.json	2022-06-08 16:23:31.000000000 +0800
+@@ -0,0 +1 @@
++[]
+\ No newline at end of file
+diff -uNr -x .idea httpx-1.2.1/common/fingerprint/fingerprint.go httpx-1.2.1-m/common/fingerprint/fingerprint.go
+--- httpx-1.2.1/common/fingerprint/fingerprint.go	1970-01-01 08:00:00.000000000 +0800
++++ httpx-1.2.1-m/common/fingerprint/fingerprint.go	2022-06-08 15:27:43.000000000 +0800
+@@ -0,0 +1,66 @@
++package fingerprint
++
++import (
++	_ "embed"
++	"encoding/json"
++	"github.com/boy-hack/govaluate"
++	"github.com/projectdiscovery/httpx/common/httpx"
++)
++
++type FingerPrint struct {
++	RuleId    int64  `json:"rule_id"`
++	Product   string `json:"product"`
++	Company   string `json:"company"`
++	Condition string `json:"condition"`
++}
++type FingerPrints []FingerPrint
++
++//go:embed data/all.json
++var FofaJson []byte
++
++func InitFingerPrints() (FingerPrints, error) {
++	//data, err := ioutil.ReadFile(filename)
++	//if err != nil {
++	//	return nil, err
++	//}
++	var fingers FingerPrints
++	err := json.Unmarshal(FofaJson, &fingers)
++	if err != nil {
++		return nil, err
++	}
++	return fingers, err
++}
++
++func (f *FingerPrint) Matcher(response *httpx.Response) (bool, error) {
++	expString := f.Condition
++	expression, err := govaluate.NewEvaluableExpressionWithFunctions(expString, HelperFunctions(response))
++	if err != nil {
++		return false, err
++	}
++	paramters := make(map[string]interface{})
++	paramters["title"] = response.Title
++	paramters["server"] = response.GetHeader("server")
++	paramters["protocol"] = "http"
++
++	result, err := expression.Evaluate(paramters)
++	if err != nil {
++		return false, err
++	}
++	t := result.(bool)
++	return t, err
++}
++
++func (f *FingerPrints) Matcher(response *httpx.Response) ([]string, error) {
++	ret := make([]string, 0)
++	for _, item := range *f {
++		v, err := item.Matcher(response)
++		if err != nil {
++			return nil, err
++		}
++		if v {
++			n := item.Product
++			ret = append(ret, n)
++		}
++	}
++	return ret, nil
++}
+diff -uNr -x .idea httpx-1.2.1/common/fingerprint/generators.go httpx-1.2.1-m/common/fingerprint/generators.go
+--- httpx-1.2.1/common/fingerprint/generators.go	1970-01-01 08:00:00.000000000 +0800
++++ httpx-1.2.1-m/common/fingerprint/generators.go	2022-06-08 15:27:58.000000000 +0800
+@@ -0,0 +1,62 @@
++package fingerprint
++
++import (
++	"fmt"
++	"github.com/boy-hack/govaluate"
++	"github.com/projectdiscovery/httpx/common/httpx"
++	"strings"
++)
++
++func toString(v interface{}) string {
++	return fmt.Sprint(v)
++}
++func toInt(v interface{}) int {
++	return int(v.(float64))
++}
++
++// HelperFunctions contains the dsl functions
++func HelperFunctions(resp *httpx.Response) (functions map[string]govaluate.ExpressionFunction) {
++	functions = make(map[string]govaluate.ExpressionFunction)
++
++	functions["title_contains"] = func(args ...interface{}) (interface{}, error) {
++		pattern := strings.ToLower(toString(args[0]))
++		title := strings.ToLower(resp.Title)
++		return strings.Index(title, pattern) != -1, nil
++	}
++
++	functions["body_contains"] = func(args ...interface{}) (interface{}, error) {
++		pattern := strings.ToLower(toString(args[0]))
++		data := strings.ToLower(resp.DataStr)
++		return strings.Index(data, pattern) != -1, nil
++	}
++
++	functions["protocol_contains"] = func(args ...interface{}) (interface{}, error) {
++		return false, nil
++	}
++
++	functions["banner_contains"] = func(args ...interface{}) (interface{}, error) {
++		return false, nil
++	}
++
++	functions["header_contains"] = func(args ...interface{}) (interface{}, error) {
++		pattern := strings.ToLower(toString(args[0]))
++		data := strings.ToLower(resp.HeaderStr)
++		return strings.Index(data, pattern) != -1, nil
++	}
++
++	functions["server_contains"] = func(args ...interface{}) (interface{}, error) {
++		pattern := strings.ToLower(toString(args[0]))
++		server := resp.GetHeader("server")
++		return strings.Index(server, pattern) != -1, nil
++	}
++
++	functions["cert_contains"] = func(args ...interface{}) (interface{}, error) {
++		return false, nil
++	}
++
++	functions["port_contains"] = func(args ...interface{}) (interface{}, error) {
++		return false, nil
++	}
++
++	return functions
++}
+diff -uNr -x .idea httpx-1.2.1/common/httpx/httpx.go httpx-1.2.1-m/common/httpx/httpx.go
+--- httpx-1.2.1/common/httpx/httpx.go	2022-04-08 21:58:49.000000000 +0800
++++ httpx-1.2.1-m/common/httpx/httpx.go	2022-06-08 15:36:18.000000000 +0800
+@@ -170,6 +170,12 @@
+ 
+ 	resp.Headers = httpresp.Header.Clone()
+ 
++	// HeaderStr
++	resp.HeaderStr = ""
++	for h, v := range resp.Headers {
++		resp.HeaderStr += fmt.Sprintf("%s: %s\n", h, strings.Join(v, " "))
++	}
++
+ 	// httputil.DumpResponse does not handle websockets
+ 	headers, rawResp, err := pdhttputil.DumpResponseHeadersAndRaw(httpresp)
+ 	if err != nil {
+@@ -224,6 +230,10 @@
+ 	}
+ 
+ 	resp.Data = respbody
++	resp.DataStr = respbodystr
++
++	// Get Title
++	resp.Title = ExtractTitle(&resp)
+ 
+ 	// fill metrics
+ 	resp.StatusCode = httpresp.StatusCode
+diff -uNr -x .idea httpx-1.2.1/common/httpx/response.go httpx-1.2.1-m/common/httpx/response.go
+--- httpx-1.2.1/common/httpx/response.go	2022-04-08 21:58:49.000000000 +0800
++++ httpx-1.2.1-m/common/httpx/response.go	2022-06-08 15:34:22.000000000 +0800
+@@ -12,8 +12,11 @@
+ type Response struct {
+ 	StatusCode    int
+ 	Headers       map[string][]string
++	HeaderStr     string
+ 	Data          []byte
++	DataStr       string
+ 	ContentLength int
++	Title         string
+ 	Raw           string
+ 	RawHeaders    string
+ 	Words         int
+diff -uNr -x .idea httpx-1.2.1/go.mod httpx-1.2.1-m/go.mod
+--- httpx-1.2.1/go.mod	2022-04-08 21:58:49.000000000 +0800
++++ httpx-1.2.1-m/go.mod	2022-06-08 15:54:00.000000000 +0800
+@@ -5,6 +5,7 @@
+ require (
+ 	github.com/akrylysov/pogreb v0.10.1 // indirect
+ 	github.com/bluele/gcache v0.0.2
++	github.com/boy-hack/govaluate v3.1.0+incompatible
+ 	github.com/corpix/uarand v0.1.1
+ 	github.com/golang/snappy v0.0.4 // indirect
+ 	github.com/hbakhtiyor/strsim v0.0.0-20190107154042-4d2bbb273edf
+@@ -47,12 +48,12 @@
+ 
+ require (
+ 	github.com/PuerkitoBio/goquery v1.8.0
++	github.com/RumbleDiscovery/jarm-go v0.0.6
++	github.com/ammario/ipisp/v2 v2.0.0
+ 	github.com/mfonda/simhash v0.0.0-20151007195837-79f94a1100d6
+ )
+ 
+ require (
+-	github.com/RumbleDiscovery/jarm-go v0.0.6 // indirect
+-	github.com/ammario/ipisp/v2 v2.0.0 // indirect
+ 	github.com/andres-erbsen/clock v0.0.0-20160526145045-9e14626cd129 // indirect
+ 	github.com/andybalholm/cascadia v1.3.1 // indirect
+ 	github.com/aymerick/douceur v0.2.0 // indirect
+diff -uNr -x .idea httpx-1.2.1/go.sum httpx-1.2.1-m/go.sum
+--- httpx-1.2.1/go.sum	2022-04-08 21:58:49.000000000 +0800
++++ httpx-1.2.1-m/go.sum	2022-06-08 15:54:00.000000000 +0800
+@@ -9,8 +9,6 @@
+ github.com/akrylysov/pogreb v0.10.0/go.mod h1:pNs6QmpQ1UlTJKDezuRWmaqkgUE2TuU0YTWyqJZ7+lI=
+ github.com/akrylysov/pogreb v0.10.1 h1:FqlR8VR7uCbJdfUob916tPM+idpKgeESDXOA1K0DK4w=
+ github.com/akrylysov/pogreb v0.10.1/go.mod h1:pNs6QmpQ1UlTJKDezuRWmaqkgUE2TuU0YTWyqJZ7+lI=
+-github.com/ammario/ipisp v1.0.0 h1:U4xdVMBFWm0/4sHrQ3hVMC+ygg/Ynm4/vdFdkVAex1o=
+-github.com/ammario/ipisp v1.0.0/go.mod h1:HM60VFpmEWyU+FisnTTHCeswaU3RW0dCVHihgIGUEGM=
+ github.com/ammario/ipisp/v2 v2.0.0 h1:/aRMp5srZViiBfOUGzl/Esqae4s0MDDzm9buhGcZ0XU=
+ github.com/ammario/ipisp/v2 v2.0.0/go.mod h1:bQ6KAL5LnYYEj6olUn+Bzv/im/4Esa5oGkbv9b+uOjo=
+ github.com/andres-erbsen/clock v0.0.0-20160526145045-9e14626cd129 h1:MzBOUgng9orim59UnfUTLRjMpd09C5uEVQ6RPGeCaVI=
+@@ -21,6 +19,8 @@
+ github.com/aymerick/douceur v0.2.0/go.mod h1:wlT5vV2O3h55X9m7iVYN0TBM0NH/MmbLnd30/FjWUq4=
+ github.com/bluele/gcache v0.0.2 h1:WcbfdXICg7G/DGBh1PFfcirkWOQV+v077yF1pSy3DGw=
+ github.com/bluele/gcache v0.0.2/go.mod h1:m15KV+ECjptwSPxKhOhQoAFQVtUFjTVkc3H8o0t/fp0=
++github.com/boy-hack/govaluate v3.1.0+incompatible h1:Ui9xUi7jayj2Sft3rZeaToB5UOC9OfyMggc+B+Y67gE=
++github.com/boy-hack/govaluate v3.1.0+incompatible/go.mod h1:qMekcE/D3ipGRM3KCm+ihzioAl/oGuRpt55GizYo0uU=
+ github.com/cnf/structhash v0.0.0-20201127153200-e1b16c1ebc08 h1:ox2F0PSMlrAAiAdknSRMDrAr8mfxPCfSZolH+/qQnyQ=
+ github.com/cnf/structhash v0.0.0-20201127153200-e1b16c1ebc08/go.mod h1:pCxVEbcm3AMg7ejXyorUXi6HQCzOIBf7zEDVPtw0/U4=
+ github.com/codegangsta/cli v1.20.0/go.mod h1:/qJNoX69yVSKu5o4jLyXAENLRyk1uhi7zkbQ3slBdOA=
+@@ -118,7 +118,6 @@
+ github.com/onsi/gomega v1.10.5/go.mod h1:gza4q3jKQJijlu05nKWRCW/GavJumGt8aNRxWg7mt48=
+ github.com/op/go-logging v0.0.0-20160315200505-970db520ece7/go.mod h1:HzydrMdWErDVzsI23lYNej1Htcns9BCg93Dk0bBINWk=
+ github.com/pkg/diff v0.0.0-20210226163009-20ebb0f2a09e/go.mod h1:pJLUxLENpZxwdsKMEsNbx1VGcRFpLqf3715MtcvvzbA=
+-github.com/pkg/errors v0.8.0/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
+ github.com/pkg/errors v0.9.1 h1:FEBLx1zS214owpjy7qsBeixbURkuhQAwrK5UwLGTwt4=
+ github.com/pkg/errors v0.9.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
+ github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
+@@ -200,7 +199,6 @@
+ github.com/spaolacci/murmur3 v1.1.0/go.mod h1:JwIasOWyU6f++ZhiEuf87xNszmSA2myDM2Kzu9HwQUA=
+ github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
+ github.com/stretchr/objx v0.1.1/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
+-github.com/stretchr/testify v1.2.1/go.mod h1:a8OnRcib4nhh0OaRAV+Yts87kKdq0PP7pXfy6kDkUVs=
+ github.com/stretchr/testify v1.2.2/go.mod h1:a8OnRcib4nhh0OaRAV+Yts87kKdq0PP7pXfy6kDkUVs=
+ github.com/stretchr/testify v1.3.0/go.mod h1:M5WIy9Dh21IEIfnGCwXGc5bZfKNJtfHm1UVUgZn+9EI=
+ github.com/stretchr/testify v1.4.0/go.mod h1:j7eGeouHqKxXV5pUuKE4zz7dFj8WfuZ+81PSLYec5m4=
+diff -uNr -x .idea httpx-1.2.1/runner/options.go httpx-1.2.1-m/runner/options.go
+--- httpx-1.2.1/runner/options.go	2022-04-08 21:58:49.000000000 +0800
++++ httpx-1.2.1-m/runner/options.go	2022-06-08 15:41:31.000000000 +0800
+@@ -1,11 +1,6 @@
+ package runner
+ 
+ import (
+-	"math"
+-	"os"
+-	"regexp"
+-	"strings"
+-	"github.com/projectdiscovery/httpx/common/slice"
+ 	"github.com/projectdiscovery/fileutil"
+ 	"github.com/projectdiscovery/goconfig"
+ 	"github.com/projectdiscovery/goflags"
+@@ -16,7 +11,12 @@
+ 	"github.com/projectdiscovery/httpx/common/customlist"
+ 	customport "github.com/projectdiscovery/httpx/common/customports"
+ 	fileutilz "github.com/projectdiscovery/httpx/common/fileutil"
++	"github.com/projectdiscovery/httpx/common/slice"
+ 	"github.com/projectdiscovery/httpx/common/stringz"
++	"math"
++	"os"
++	"regexp"
++	"strings"
+ )
+ 
+ const (
+@@ -72,6 +72,7 @@
+ 	OutputLinesCount          bool
+ 	OutputWordsCount          bool
+ 	Hashes                    string
++	CustomFingerprint         bool
+ }
+ 
+ func (s *scanOptions) Clone() *scanOptions {
+@@ -116,6 +117,7 @@
+ 		OutputLinesCount:          s.OutputLinesCount,
+ 		OutputWordsCount:          s.OutputWordsCount,
+ 		Hashes:                    s.Hashes,
++		CustomFingerprint:         s.CustomFingerprint,
+ 	}
+ }
+ 
+@@ -229,6 +231,7 @@
+ 	Hashes                    string
+ 	Jarm                      bool
+ 	Asn                       bool
++	CustomFingerprint         bool
+ }
+ 
+ // ParseOptions parses the command line options for application
+@@ -264,6 +267,7 @@
+ 		flagSet.BoolVar(&options.Asn, "asn", false, "display host asn information"),
+ 		flagSet.BoolVar(&options.OutputCDN, "cdn", false, "display cdn in use"),
+ 		flagSet.BoolVar(&options.Probe, "probe", false, "display probe status"),
++		flagSet.BoolVarP(&options.CustomFingerprint, "custom-fingerprint", "cf", false, "display custom fingerprint detected"),
+ 	)
+ 
+ 	createGroup(flagSet, "matchers", "Matchers",
+diff -uNr -x .idea httpx-1.2.1/runner/runner.go httpx-1.2.1-m/runner/runner.go
+--- httpx-1.2.1/runner/runner.go	2022-04-08 21:58:49.000000000 +0800
++++ httpx-1.2.1-m/runner/runner.go	2022-06-08 15:45:49.000000000 +0800
+@@ -7,6 +7,7 @@
+ 	"encoding/csv"
+ 	"encoding/json"
+ 	"fmt"
++	"github.com/projectdiscovery/httpx/common/fingerprint"
+ 	"io/ioutil"
+ 	"net"
+ 	"net/http"
+@@ -60,6 +61,7 @@
+ 	hp              *httpx.HTTPX
+ 	wappalyzer      *wappalyzer.Wappalyze
+ 	scanopts        scanOptions
++	fingerprints    *fingerprint.FingerPrints
+ 	hm              *hybrid.HybridMap
+ 	stats           clistats.StatisticsClient
+ 	ratelimiter     ratelimit.Limiter
+@@ -131,6 +133,13 @@
+ 		gologger.Fatal().Msgf("Could not create httpx instance: %s\n", err)
+ 	}
+ 
++	// FingerPrints
++	fingerprints, err := fingerprint.InitFingerPrints()
++	if err != nil {
++		return nil, err
++	}
++	runner.fingerprints = &fingerprints
++
+ 	var scanopts scanOptions
+ 
+ 	if options.InputRawRequest != "" {
+@@ -230,6 +239,7 @@
+ 	scanopts.OutputLinesCount = options.OutputLinesCount
+ 	scanopts.OutputWordsCount = options.OutputWordsCount
+ 	scanopts.Hashes = options.Hashes
++	scanopts.CustomFingerprint = options.CustomFingerprint
+ 	runner.scanopts = scanopts
+ 
+ 	if options.ShowStatistics {
+@@ -886,6 +896,22 @@
+ 		req.Header.Add("Connection", "close")
+ 	}
+ 	resp, err := hp.Do(req, httpx.UnsafeOptions{URIPath: reqURI})
++
++	// Status Code 200 & window.location
++	if resp != nil {
++		if len(resp.DataStr) < 200 && strings.Contains(resp.DataStr, "window.location=\"") {
++			re, _ := regexp.Compile("window\\.location=\"([0-9a-zA-Z/.]+)\";")
++			if len(re.FindStringSubmatch(resp.DataStr)) > 0 {
++				uri := re.FindStringSubmatch(resp.DataStr)[1]
++				if !strings.HasPrefix(uri, "/") {
++					uri = "/" + uri
++				}
++				req.URL.Path = uri
++				resp, _ = hp.Do(req, httpx.UnsafeOptions{URIPath: uri})
++			}
++		}
++	}
++
+ 	if r.options.ShowStatistics {
+ 		r.stats.IncrementCounter("requests", 1)
+ 	}
+@@ -1160,6 +1186,29 @@
+ 		builder.WriteString(fmt.Sprintf(" [%s]", ip))
+ 	}
+ 
++	// 指纹处理
++	fingerStr := ""
++	var fingerPrints []string
++	if scanopts.CustomFingerprint {
++		fingerResults, err := r.fingerprints.Matcher(resp)
++		if err != nil {
++			gologger.Error().Msgf("FingerPrint error: %s", err)
++		}
++		if fingerResults != nil {
++
++			fingerPrints = fingerResults
++			fingerStr = strings.Join(fingerPrints, ",")
++
++			builder.WriteString(" [")
++			if !scanopts.OutputWithNoColor {
++				builder.WriteString(aurora.Red(fingerStr).String())
++			} else {
++				builder.WriteString(fingerStr)
++			}
++			builder.WriteRune(']')
++		}
++	}
++
+ 	ips, cnames, err := getDNSData(hp, domain)
+ 	if err != nil {
+ 		ips = append(ips, ip)
+@@ -1293,7 +1342,7 @@
+ 	}
+ 	jarmhash := ""
+ 	if r.options.Jarm {
+-		jarmhash = hashes.Jarm(fullURL,r.options.Timeout)
++		jarmhash = hashes.Jarm(fullURL, r.options.Timeout)
+ 		builder.WriteString(" [")
+ 		if !scanopts.OutputWithNoColor {
+ 			builder.WriteString(aurora.Magenta(jarmhash).String())
+@@ -1411,6 +1460,7 @@
+ 		Lines:            resp.Lines,
+ 		Words:            resp.Words,
+ 		ASN:              asnResponse,
++		Fingerprint:      fingerStr,
+ 	}
+ }
+ 
+@@ -1478,6 +1528,7 @@
+ 	Lines            int                 `json:"lines" csv:"lines"`
+ 	Words            int                 `json:"words" csv:"words"`
+ 	Jarm             string              `json:"jarm,omitempty" csv:"jarm"`
++	Fingerprint      string              `json:"fingerprint,omitempty" csv:"fingerprint"`
+ }
+ 
+ // JSON the result
